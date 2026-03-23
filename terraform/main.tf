@@ -39,3 +39,72 @@ resource "aws_dynamodb_table" "resultados_tabla" {
 output "s3_bucket_name" {
   value = aws_s3_bucket.analisis_bucket.id
 }
+
+# --- IAM Role para la Lambda ---
+resource "aws_iam_role" "lambda_role" {
+  name = "sentiment_lambda_role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+    }]
+  })
+}
+
+# --- Permisos (S3, DynamoDB, Comprehend y Logs) ---
+resource "aws_iam_role_policy_attachment" "lambda_logs" {
+  role       = aws_iam_role.lambda_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+# Nota: En producción, usa políticas más restrictivas (Least Privilege)
+resource "aws_iam_policy" "lambda_extra_perms" {
+  name = "sentiment_analysis_perms"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      { Action = ["s3:GetObject"], Effect = "Allow", Resource = "${aws_s3_bucket.analisis_bucket.arn}/*" },
+      { Action = ["dynamodb:PutItem"], Effect = "Allow", Resource = aws_dynamodb_table.resultados_tabla.arn },
+      { Action = ["comprehend:DetectSentiment"], Effect = "Allow", Resource = "*" }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "attach_extra" {
+  role       = aws_iam_role.lambda_role.name
+  policy_arn = aws_iam_policy.lambda_extra_perms.arn
+}
+
+# --- La Función Lambda ---
+resource "aws_lambda_function" "sentiment_processor" {
+  filename      = "lambda_function_payload.zip" # Terraform necesita el código comprimido
+  function_name = "SentimentProcessor"
+  role          = aws_iam_role.lambda_role.arn
+  handler       = "lambda_handler.lambda_handler"
+  runtime       = "python3.12"
+
+  # Esto permite que Terraform suba tu código automáticamente
+  source_code_hash = filebase64sha256("lambda_function_payload.zip")
+}
+
+# --- Trigger: Activar Lambda cuando se sube algo a S3 ---
+resource "aws_s3_bucket_notification" "bucket_notification" {
+  bucket = aws_s3_bucket.analisis_bucket.id
+
+  lambda_function {
+    lambda_function_arn = aws_lambda_function.sentiment_processor.arn
+    events              = ["s3:ObjectCreated:*"]
+    filter_suffix       = ".txt" # Solo archivos de texto
+  }
+}
+
+resource "aws_lambda_permission" "allow_s3" {
+  statement_id  = "AllowExecutionFromS3Bucket"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.sentiment_processor.function_name
+  principal     = "s3.amazonaws.com"
+  source_arn    = aws_s3_bucket.analisis_bucket.arn
+}
